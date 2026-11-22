@@ -6,7 +6,19 @@
 3. 领单：GET /selection，返回当前名单（含条目修订号）及待查状态。
 4. 回报：POST /reports，带领单所见修订号；题名/分馆改过或条目曾删除，旧回报一律退回。
 
-持久化：全部状态存于单个 SQLite 文件，重启后沿用最近生效的名单与回报。
+发放存储（按规则共享，不再逐单复制名单）：
+- 同一 (seed, quota) 为一套规则（rules 表，全库唯一）；换版时每套规则只重算一次名单，
+  多张单沿用同一规则不再各算各存。
+- rule_bibs 每套规则按"曾入选的不同书目"存一行：entered_seq 为最近一次入选时的目录
+  版本号，exited_seq 为落选时的目录版本号（NULL 表示当前在名单中）；只在该书目入选
+  状态变化时更新，落选票目保留行不清除。
+- 每开一单只新增 orders 中固定大小的 (rule_id, base_seq)：base_seq 为开单时最新目录
+  版本号。回报受理范围 = 当前在名单中，或落选版本号 > base_seq —— 即"本单开出时或
+  此后成功换版中入选过"；即使后来落选，只要书目还在目录中，就可凭现行修订号回报。
+- 旧库逐单保存的 issued 记录保留为只读，仍只对原单有效，不并入共享记录。
+
+一致性：开单/换版与对应发放在同一事务生效，写入失败整体回滚、保留原状态；
+全部状态存于单个 SQLite 文件，重启后按已提交的发放受理回报。
 """
 
 from __future__ import annotations
@@ -23,10 +35,20 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 SCHEMA = """
+-- 抽样规则：同一 (seed, quota) 全库唯一，名单按规则共享
+CREATE TABLE IF NOT EXISTS rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seed INTEGER NOT NULL,
+    quota INTEGER NOT NULL CHECK (quota >= 1),
+    UNIQUE(seed, quota)
+);
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     seed INTEGER NOT NULL,
     quota INTEGER NOT NULL CHECK (quota >= 1),
+    -- 固定大小的发放信息：所属规则 + 开单时最新目录版本号
+    rule_id INTEGER REFERENCES rules(id),
+    base_seq INTEGER,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS catalog_versions (
@@ -47,7 +69,16 @@ CREATE TABLE IF NOT EXISTS bib_revisions (
     bib_no TEXT PRIMARY KEY,
     last_revision INTEGER NOT NULL
 );
--- 已发给质检员的条目（历史并集；落选后未改动仍可回报）
+-- 每套规则曾入选的书目（共享发放记录）：entered_seq 为最近一次入选时的目录版本号，
+-- exited_seq 为落选时的目录版本号，NULL 表示当前在名单中
+CREATE TABLE IF NOT EXISTS rule_bibs (
+    rule_id INTEGER NOT NULL REFERENCES rules(id),
+    bib_no TEXT NOT NULL,
+    entered_seq INTEGER NOT NULL,
+    exited_seq INTEGER,
+    PRIMARY KEY (rule_id, bib_no)
+);
+-- 旧版逐单发放记录（遗留只读，仍只对原单有效；新单不再写入）
 CREATE TABLE IF NOT EXISTS issued (
     order_id INTEGER NOT NULL REFERENCES orders(id),
     bib_no TEXT NOT NULL,
@@ -63,6 +94,8 @@ CREATE TABLE IF NOT EXISTS reports (
     created_at TEXT NOT NULL
 );
 """
+
+ORDER_COLS = "id, seed, quota, rule_id, base_seq, created_at"
 
 
 def utcnow() -> str:
@@ -103,38 +136,9 @@ def create_app(db_path: str) -> FastAPI:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        with lock:
-            conn.executescript(SCHEMA)
-            conn.commit()
-        yield
-        with lock:
-            conn.close()
-
-    app = FastAPI(title="馆藏目录抽检 API", version="1.0.0", lifespan=lifespan)
-
     # ---------- 内部 helpers ----------
 
-    def active_order() -> Optional[sqlite3.Row]:
-        return conn.execute(
-            "SELECT id, seed, quota, created_at FROM orders ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-
-    def resolve_order(order_id: Optional[int]) -> sqlite3.Row:
-        if order_id is None:
-            row = active_order()
-            if row is None:
-                raise HTTPException(status_code=409, detail="尚未开单")
-            return row
-        row = conn.execute(
-            "SELECT id, seed, quota, created_at FROM orders WHERE id=?", (order_id,)
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="抽检单不存在")
-        return row
-
-    def compute_selection(order: sqlite3.Row) -> list[sqlite3.Row]:
+    def compute_selection(seed: int, quota: int) -> list[sqlite3.Row]:
         """按固定随机优先级逐馆重选；条目不足则全查。"""
         rows = conn.execute(
             "SELECT bib_no, branch, title, revision FROM entries"
@@ -145,22 +149,93 @@ def create_app(db_path: str) -> FastAPI:
         selected: list[sqlite3.Row] = []
         for branch in sorted(by_branch):
             items = by_branch[branch]
-            items.sort(key=lambda r: (priority(order["seed"], r["bib_no"]), r["bib_no"]))
-            selected.extend(items[: order["quota"]])
+            items.sort(key=lambda r: (priority(seed, r["bib_no"]), r["bib_no"]))
+            selected.extend(items[:quota])
         return selected
 
-    def refresh_issued(order_id: int) -> int:
-        """把当前名单并入已发集合（只对未发过的条目插入，保留首次领单时的修订号）。"""
-        order = conn.execute(
-            "SELECT id, seed, quota FROM orders WHERE id=?", (order_id,)
+    def current_version_id() -> int:
+        """当前生效目录版本号（尚无版本时为 0），作为发放记录的版本刻度。"""
+        row = conn.execute(
+            "SELECT id FROM catalog_versions ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        selected = compute_selection(order)
-        for r in selected:
-            conn.execute(
-                "INSERT OR IGNORE INTO issued(order_id, bib_no, issued_revision) VALUES (?,?,?)",
-                (order_id, r["bib_no"], r["revision"]),
+        return row["id"] if row else 0
+
+    def migrate_legacy() -> None:
+        """旧库升级：orders 补 (rule_id, base_seq)，并按现行目录为每套规则回填当前名单。
+
+        同一种子和名额只建一套规则；旧表 issued 的逐单记录保持原样，仍只对原单有效。
+        """
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
+        if "rule_id" in cols:
+            return
+        conn.execute("ALTER TABLE orders ADD COLUMN rule_id INTEGER REFERENCES rules(id)")
+        conn.execute("ALTER TABLE orders ADD COLUMN base_seq INTEGER")
+        base = current_version_id()
+        rule_ids: dict[tuple[int, int], int] = {}
+        for row in conn.execute("SELECT DISTINCT seed, quota FROM orders").fetchall():
+            cur = conn.execute(
+                "INSERT INTO rules(seed, quota) VALUES (?,?)",
+                (row["seed"], row["quota"]),
             )
-        return len(selected)
+            rule_ids[(row["seed"], row["quota"])] = cur.lastrowid
+        for (seed, quota), rule_id in rule_ids.items():
+            for r in compute_selection(seed, quota):
+                conn.execute(
+                    "INSERT INTO rule_bibs(rule_id, bib_no, entered_seq) VALUES (?,?,?)",
+                    (rule_id, r["bib_no"], base),
+                )
+            conn.execute(
+                "UPDATE orders SET rule_id=?, base_seq=? WHERE seed=? AND quota=?",
+                (rule_id, base, seed, quota),
+            )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        with lock:
+            conn.executescript(SCHEMA)
+            migrate_legacy()
+            conn.commit()
+        yield
+        with lock:
+            conn.close()
+
+    app = FastAPI(title="馆藏目录抽检 API", version="1.0.0", lifespan=lifespan)
+
+    def active_order() -> Optional[sqlite3.Row]:
+        return conn.execute(
+            f"SELECT {ORDER_COLS} FROM orders ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    def resolve_order(order_id: Optional[int]) -> sqlite3.Row:
+        if order_id is None:
+            row = active_order()
+            if row is None:
+                raise HTTPException(status_code=409, detail="尚未开单")
+            return row
+        row = conn.execute(
+            f"SELECT {ORDER_COLS} FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="抽检单不存在")
+        return row
+
+    def was_issued(order: sqlite3.Row, bib_no: str) -> bool:
+        """该书目是否在本单开出时或此后成功换版中入选过（含旧库逐单记录）。"""
+        legacy = conn.execute(
+            "SELECT 1 FROM issued WHERE order_id=? AND bib_no=?",
+            (order["id"], bib_no),
+        ).fetchone()
+        if legacy is not None:
+            return True  # 旧库逐单保存的记录，只对原单有效
+        if order["rule_id"] is None:
+            return False
+        # 共享发放：当前在名单中，或落选版本晚于开单基准版本（即开单后曾入选）
+        shared = conn.execute(
+            "SELECT 1 FROM rule_bibs WHERE rule_id=? AND bib_no=? "
+            "AND (exited_seq IS NULL OR exited_seq > ?)",
+            (order["rule_id"], bib_no, order["base_seq"]),
+        ).fetchone()
+        return shared is not None
 
     def effective_report(order_id: int, bib_no: str, revision: int) -> Optional[sqlite3.Row]:
         return conn.execute(
@@ -180,12 +255,40 @@ def create_app(db_path: str) -> FastAPI:
         with lock:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                base_seq = current_version_id()
+                rule = conn.execute(
+                    "SELECT id FROM rules WHERE seed=? AND quota=?",
+                    (payload.seed, payload.quota),
+                ).fetchone()
+                if rule is None:
+                    # 新规则：名单只算这一次，此后由换版按状态变化增量维护
+                    cur = conn.execute(
+                        "INSERT INTO rules(seed, quota) VALUES (?,?)",
+                        (payload.seed, payload.quota),
+                    )
+                    rule_id = cur.lastrowid
+                    selected = compute_selection(payload.seed, payload.quota)
+                    for r in selected:
+                        conn.execute(
+                            "INSERT INTO rule_bibs(rule_id, bib_no, entered_seq) "
+                            "VALUES (?,?,?)",
+                            (rule_id, r["bib_no"], base_seq),
+                        )
+                    issued_count = len(selected)
+                else:
+                    # 沿用既有规则的共享名单，本单只记固定大小的 (rule_id, base_seq)
+                    rule_id = rule["id"]
+                    issued_count = conn.execute(
+                        "SELECT COUNT(*) AS c FROM rule_bibs "
+                        "WHERE rule_id=? AND exited_seq IS NULL",
+                        (rule_id,),
+                    ).fetchone()["c"]
                 cur = conn.execute(
-                    "INSERT INTO orders(seed, quota, created_at) VALUES (?,?,?)",
-                    (payload.seed, payload.quota, utcnow()),
+                    "INSERT INTO orders(seed, quota, rule_id, base_seq, created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (payload.seed, payload.quota, rule_id, base_seq, utcnow()),
                 )
                 order_id = cur.lastrowid
-                issued_count = refresh_issued(order_id)
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -209,7 +312,12 @@ def create_app(db_path: str) -> FastAPI:
                 raise
         if order is None:
             raise HTTPException(status_code=404, detail="尚未开单")
-        return dict(order)
+        return {
+            "id": order["id"],
+            "seed": order["seed"],
+            "quota": order["quota"],
+            "created_at": order["created_at"],
+        }
 
     @app.post("/catalog/versions", status_code=201, summary="换版：整版目录原子生效，失败保留原目录")
     def upload_catalog(payload: CatalogIn):
@@ -267,9 +375,34 @@ def create_app(db_path: str) -> FastAPI:
                     if b not in keep:
                         conn.execute("DELETE FROM entries WHERE bib_no=?", (b,))
                         removed += 1
-                # 换版后各馆按固定优先级重选，并把新名单并入已发集合
-                for row in conn.execute("SELECT id FROM orders").fetchall():
-                    refresh_issued(row["id"])
+                # 换版后每套规则按固定优先级重选一次（同一种子和名额只算一次名单），
+                # 发放记录只为入选状态变化的书目更新
+                for rule in conn.execute("SELECT id, seed, quota FROM rules").fetchall():
+                    selected = compute_selection(rule["seed"], rule["quota"])
+                    selected_bibs = {r["bib_no"] for r in selected}
+                    current_bibs = {
+                        r["bib_no"]
+                        for r in conn.execute(
+                            "SELECT bib_no FROM rule_bibs "
+                            "WHERE rule_id=? AND exited_seq IS NULL",
+                            (rule["id"],),
+                        )
+                    }
+                    for bib_no in sorted(selected_bibs - current_bibs):
+                        # 新入选或落选后再入选：重置入选版本、清除落选标记
+                        conn.execute(
+                            "INSERT INTO rule_bibs(rule_id, bib_no, entered_seq, exited_seq) "
+                            "VALUES (?,?,?,NULL) "
+                            "ON CONFLICT(rule_id, bib_no) DO UPDATE SET "
+                            "entered_seq=excluded.entered_seq, exited_seq=NULL",
+                            (rule["id"], bib_no, version_id),
+                        )
+                    for bib_no in sorted(current_bibs - selected_bibs):
+                        # 落选：只记落选版本，保留行（曾入选事实不清除）
+                        conn.execute(
+                            "UPDATE rule_bibs SET exited_seq=? WHERE rule_id=? AND bib_no=?",
+                            (version_id, rule["id"], bib_no),
+                        )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -312,7 +445,7 @@ def create_app(db_path: str) -> FastAPI:
             conn.execute("BEGIN")
             try:
                 order = resolve_order(order_id)
-                selected = compute_selection(order)
+                selected = compute_selection(order["seed"], order["quota"])
                 items = []
                 for r in selected:
                     rep = effective_report(order["id"], r["bib_no"], r["revision"])
@@ -348,11 +481,7 @@ def create_app(db_path: str) -> FastAPI:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 order = resolve_order(order_id)
-                issued = conn.execute(
-                    "SELECT 1 FROM issued WHERE order_id=? AND bib_no=?",
-                    (order["id"], payload.bib_no),
-                ).fetchone()
-                if issued is None:
+                if not was_issued(order, payload.bib_no):
                     raise HTTPException(status_code=409, detail="该条目未发给质检员，回报退回")
                 entry = conn.execute(
                     "SELECT revision FROM entries WHERE bib_no=?", (payload.bib_no,)
