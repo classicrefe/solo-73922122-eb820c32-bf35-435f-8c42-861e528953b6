@@ -1,0 +1,13 @@
+services:
+  qc:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      QC_DB_PATH: /data/qc.db
+    volumes:
+      - qc-data:/data
+    restart: unless-stopped
+
+volumes:
+  qc-data:
